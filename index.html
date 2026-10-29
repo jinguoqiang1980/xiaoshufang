@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>小书房</title>
+<meta name="description" content="小书房 — 本地电子书阅读器，支持 TXT / EPUB，离线可用">
+<meta name="theme-color" content="#f4ecd8">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="小书房">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ 书架 ============ -->
+<section id="shelf" class="screen">
+  <header class="shelf-head">
+    <h1>小书房</h1>
+    <div class="head-actions">
+      <button id="btnExportAll" class="icon-btn" aria-label="导出全部笔记">
+        <svg viewBox="0 0 24 24"><path d="M4 20h16M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5"/></svg>
+      </button>
+      <button id="btnImport" class="icon-btn primary" aria-label="导入书籍">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+    </div>
+  </header>
+  <div id="books" class="books"></div>
+  <div id="empty" class="empty hidden">
+    <svg viewBox="0 0 24 24"><path d="M3 5.5C5.5 4.5 8.5 4.5 12 6.5c3.5-2 6.5-2 9-1V19c-2.5-1-5.5-1-9 1-3.5-2-6.5-2-9-1z M12 6.5V20"/></svg>
+    <p>书架还是空的</p>
+    <button id="btnImport2" class="btn-primary">导入 TXT / EPUB</button>
+    <small>书只保存在这台手机里，不会上传</small>
+  </div>
+  <p class="shelf-tip" id="shelfTip">长按书本可以删除</p>
+  <input type="file" id="file" accept=".txt,.epub,text/plain,application/epub+zip" multiple hidden>
+</section>
+
+<!-- ============ 阅读页 ============ -->
+<section id="reader" class="screen hidden">
+  <div id="hdr"></div>
+  <div id="viewer"><div id="content"></div></div>
+  <div id="ribbon" class="hidden"></div>
+  <div id="status"><span id="stLeft"></span><span id="stRight"></span></div>
+
+  <div id="topbar" class="bar">
+    <button id="btnBack" class="bar-btn" aria-label="返回书架">
+      <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg><span>书架</span>
+    </button>
+    <div id="bookTitle"></div>
+    <button id="btnBm" class="bar-btn" aria-label="书签">
+      <svg viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4.5L6 21z"/></svg>
+    </button>
+  </div>
+
+  <div id="bottombar" class="bar">
+    <div class="prog-row">
+      <button id="btnPrevCh" class="txt-btn">上一章</button>
+      <input type="range" id="prog" min="0" max="1000" value="0">
+      <button id="btnNextCh" class="txt-btn">下一章</button>
+    </div>
+    <div class="tool-row">
+      <button data-tool="toc"><svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg><span>目录</span></button>
+      <button data-tool="bm"><svg viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4.5L6 21z"/></svg><span>书签</span></button>
+      <button data-tool="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg><span>搜索</span></button>
+      <button data-tool="notes"><svg viewBox="0 0 24 24"><path d="M4 20l4-1 11-11-3-3L5 16zM14 6l3 3"/></svg><span>笔记</span></button>
+      <button data-tool="tts"><svg viewBox="0 0 24 24"><path d="M4 13v-1a8 8 0 0116 0v1M4 13h3v6H5a1 1 0 01-1-1zM20 13h-3v6h2a1 1 0 001-1z"/></svg><span>朗读</span></button>
+      <button data-tool="settings"><svg viewBox="0 0 24 24"><path d="M4 19l5-14h1l5 14M6 14h7M16 19l2.5-7h.5L21.5 19M17 16.5h4"/></svg><span>设置</span></button>
+    </div>
+  </div>
+
+  <div id="ttsbar" class="hidden">
+    <button id="ttsPlay" aria-label="暂停/继续"></button>
+    <button id="ttsInfo" class="tts-info" aria-label="朗读设置"></button>
+    <button id="ttsStop" aria-label="退出朗读"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  </div>
+
+  <div id="selbar" class="hidden">
+    <button data-act="hl">高亮</button>
+    <button data-act="note">写笔记</button>
+  </div>
+</section>
+
+<!-- ============ 弹出面板 / 对话框 ============ -->
+<div id="sheetMask" class="mask hidden"></div>
+<div id="sheet" class="sheet">
+  <div class="sheet-head"><span id="sheetTitle"></span><button id="sheetClose" aria-label="关闭">✕</button></div>
+  <div id="sheetBody"></div>
+</div>
+<div id="modalMask" class="mask modal-mask hidden"><div id="modal"></div></div>
+<div id="toast"></div>
+<div id="loading" class="hidden"><div class="spinner"></div><p id="loadingText">正在导入…</p></div>
+
+<script src="jszip.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
