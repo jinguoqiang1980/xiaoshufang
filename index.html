@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>小书房</title>
-<meta name="description" content="小书房 — 本地电子书阅读器，支持 TXT / EPUB，离线可用">
+<meta name="description" content="小书房 — 本地电子书阅读器，支持 TXT / EPUB / PDF，离线可用">
 <meta name="theme-color" content="#f4ecd8">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -34,11 +34,11 @@
   <div id="empty" class="empty hidden">
     <svg viewBox="0 0 24 24"><path d="M3 5.5C5.5 4.5 8.5 4.5 12 6.5c3.5-2 6.5-2 9-1V19c-2.5-1-5.5-1-9 1-3.5-2-6.5-2-9-1z M12 6.5V20"/></svg>
     <p>书架还是空的</p>
-    <button id="btnImport2" class="btn-primary">导入 TXT / EPUB</button>
+    <button id="btnImport2" class="btn-primary">导入 TXT / EPUB / PDF</button>
     <small>书只保存在这台手机里，不会上传</small>
   </div>
   <p class="shelf-tip" id="shelfTip">长按书本可以删除</p>
-  <input type="file" id="file" accept=".txt,.epub,text/plain,application/epub+zip" multiple hidden>
+  <input type="file" id="file" accept=".txt,.epub,.pdf,text/plain,application/epub+zip,application/pdf" multiple hidden>
 </section>
 
 <!-- ============ 阅读页 ============ -->

@@ -217,6 +217,93 @@ async function parseEpub(buf, name) {
 }
 
 /* =========================================================
+ * 解析 PDF（用 pdf.js 提取文字）
+ * ========================================================= */
+let pdfjsReady = null;
+function loadPdfjs() {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  return pdfjsReady || (pdfjsReady = new Promise((ok, fail) => {
+    const s = document.createElement('script');
+    s.src = './pdfjs/pdf.min.js';
+    s.onload = () => {
+      if (!window.pdfjsLib) return fail(new Error('PDF 组件没有加载'));
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = './pdfjs/pdf.worker.min.js';
+      ok(window.pdfjsLib);
+    };
+    s.onerror = () => { pdfjsReady = null; fail(new Error('PDF 组件加载失败，请联网后重试')); };
+    document.head.appendChild(s);
+  }));
+}
+
+// 把一页的文字片段按位置拼成行，再合并成段落
+function pdfPageLines(items) {
+  const lines = [];
+  let cur = '', lastY = null, lastH = 0;
+  for (const it of items) {
+    if (!('str' in it)) continue;
+    const y = it.transform[5], h = Math.abs(it.transform[3]) || it.height || 10;
+    if (lastY !== null && Math.abs(y - lastY) > Math.max(h, lastH) * 0.5) { lines.push({ t: cur, y: lastY, h: lastH }); cur = ''; }
+    cur += it.str;
+    if (it.hasEOL) { lines.push({ t: cur, y, h }); cur = ''; lastY = null; continue; }
+    if (it.str.trim()) { lastY = y; lastH = h; } else if (lastY === null) { lastY = y; lastH = h; }
+  }
+  if (cur) lines.push({ t: cur, y: lastY, h: lastH });
+  // PDF 里常把“一、文、用”等存成康熙部首字符（⼀⽂⽤），统一转回普通汉字
+  const fix = t => t.replace(/[\u2E80-\u2EFF\u2F00-\u2FDF]/g, c => c.normalize('NFKC'));
+  return lines.map(l => ({ ...l, t: cleanLine(fix(l.t)) })).filter(l => l.t);
+}
+
+function pdfJoinLines(lines) {
+  // 典型行宽：用来判断一行是否“写满”（没写满通常是段落结尾）
+  const lens = lines.map(l => l.t.length).sort((a, b) => a - b);
+  const full = lens.length ? lens[Math.floor(lens.length * 0.8)] : 0;
+  const paras = [];
+  let buf = '';
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i].t;
+    if (/^\d{1,4}$|^[-–—\s]*\d{1,4}[-–—\s]*$|^第\s*\d+\s*页/.test(l)) continue; // 页码
+    if (CH_RE.test(l) && l.length <= 40) { if (buf) paras.push(buf); paras.push(l); buf = ''; continue; }
+    if (buf && /[a-zA-Z]$/.test(buf) && /^[a-zA-Z]/.test(l)) buf += ' ';
+    buf += l;
+    const short = full >= 8 && l.length < full * 0.85;
+    const endPunct = /[。！？!?」』”…）)：:]$/.test(l);
+    if (short || (endPunct && full < 8)) { paras.push(buf); buf = ''; }
+  }
+  if (buf) paras.push(buf);
+  return paras;
+}
+
+async function parsePdf(buf, name, onProgress) {
+  const lib = await loadPdfjs();
+  const doc = await lib.getDocument({
+    data: new Uint8Array(buf), cMapUrl: './pdfjs/cmaps/', cMapPacked: true,
+    isEvalSupported: false, disableFontFace: true, useSystemFonts: false
+  }).promise;
+  let title = name, author = '';
+  try {
+    const md = await doc.getMetadata();
+    if (md.info && md.info.Title && md.info.Title.trim().length > 1) title = md.info.Title.trim();
+    if (md.info && md.info.Author) author = md.info.Author.trim();
+  } catch (e) {}
+  const all = [];
+  let chars = 0;
+  for (let p = 1; p <= doc.numPages; p++) {
+    if (onProgress) onProgress(p, doc.numPages);
+    const page = await doc.getPage(p);
+    const tc = await page.getTextContent();
+    const lines = pdfPageLines(tc.items);
+    chars += lines.reduce((s, l) => s + l.t.replace(/\s/g, '').length, 0);
+    all.push(...lines);
+    page.cleanup();
+    if (p % 5 === 0) await sleep(0);
+  }
+  doc.destroy();
+  if (chars < Math.max(20, doc.numPages * 5)) throw new Error('这本 PDF 是扫描图片，暂时无法提取文字');
+  return { title, author, format: 'pdf', chapters: splitChapters(pdfJoinLines(all).join('\n')) };
+}
+
+
+/* =========================================================
  * 导入 & 书架
  * ========================================================= */
 async function importFiles(files) {
@@ -226,10 +313,13 @@ async function importFiles(files) {
     await sleep(50);
     try {
       const buf = await f.arrayBuffer();
-      const name = f.name.replace(/\.(txt|epub)$/i, '');
+      const name = f.name.replace(/\.(txt|epub|pdf)$/i, '');
       const head = new Uint8Array(buf.slice(0, 4));
       const isZip = head[0] === 0x50 && head[1] === 0x4B;
-      const res = (/\.epub$/i.test(f.name) || isZip) ? await parseEpub(buf, name) : parseTxt(buf, name);
+      const isPdf = head[0] === 0x25 && head[1] === 0x50 && head[2] === 0x44 && head[3] === 0x46; // %PDF
+      const res = (/\.pdf$/i.test(f.name) || isPdf)
+        ? await parsePdf(buf, name, (p, n) => showLoading(`正在导入《${f.name}》… 第 ${p}/${n} 页`))
+        : (/\.epub$/i.test(f.name) || isZip) ? await parseEpub(buf, name) : parseTxt(buf, name);
       if (!res.chapters.length) throw new Error('没有读到文字内容');
       const id = uid();
       const total = res.chapters.reduce((s, c) => s + c.text.length + 1, 0);
