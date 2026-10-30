@@ -1,6 +1,6 @@
 /* 小书房 离线缓存（Service Worker）
  * 以后修改了代码，把下面的版本号 v1 改成 v2、v3…，手机上重新打开两次即可更新。 */
-const CACHE = 'xiaoshufang-v3';
+const CACHE = 'xiaoshufang-v4';
 const ASSETS = [
   './', './index.html', './style.css', './app.js', './jszip.min.js', './manifest.webmanifest',
   './pdfjs/pdf.min.js', './pdfjs/pdf.worker.min.js',

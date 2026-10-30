@@ -273,53 +273,123 @@ function pdfJoinLines(lines) {
   return paras;
 }
 
-async function parsePdf(buf, name, onProgress) {
+// 不把整本 PDF 读进内存：pdf.js 需要哪段数据，就从 Blob 里切哪段（大文件也不怕）
+async function openPdfBlob(blob) {
   const lib = await loadPdfjs();
-  const doc = await lib.getDocument({
-    data: new Uint8Array(buf), cMapUrl: './pdfjs/cmaps/', cMapPacked: true,
-    isEvalSupported: false, disableFontFace: true, useSystemFonts: false
+  const head = new Uint8Array(await blob.slice(0, Math.min(blob.size, 65536)).arrayBuffer());
+  const range = new lib.PDFDataRangeTransport(blob.size, head);
+  range.requestDataRange = (begin, end) => {
+    blob.slice(begin, end).arrayBuffer().then(b => range.onDataRange(begin, new Uint8Array(b)));
+  };
+  return lib.getDocument({
+    range, length: blob.size, rangeChunkSize: 262144, disableAutoFetch: true, disableStream: true,
+    cMapUrl: './pdfjs/cmaps/', cMapPacked: true, isEvalSupported: false, disableFontFace: true, useSystemFonts: false
   }).promise;
+}
+
+async function parsePdf(blob, name, onProgress) {
+  const doc = await openPdfBlob(blob);
   let title = name, author = '';
   try {
     const md = await doc.getMetadata();
     if (md.info && md.info.Title && md.info.Title.trim().length > 1) title = md.info.Title.trim();
     if (md.info && md.info.Author) author = md.info.Author.trim();
   } catch (e) {}
+  const n = doc.numPages, probe = Math.min(n, 12);
   const all = [];
-  let chars = 0;
-  for (let p = 1; p <= doc.numPages; p++) {
-    if (onProgress) onProgress(p, doc.numPages);
+  let chars = 0, scanned = false;
+  for (let p = 1; p <= n; p++) {
+    if (onProgress) onProgress(p, n);
     const page = await doc.getPage(p);
     const tc = await page.getTextContent();
     const lines = pdfPageLines(tc.items);
     chars += lines.reduce((s, l) => s + l.t.replace(/\s/g, '').length, 0);
     all.push(...lines);
     page.cleanup();
+    // 先看前几页：几乎没字就是扫描版，不用再往下提取了
+    if (p === probe && chars < Math.max(20, probe * 15)) { scanned = true; break; }
     if (p % 5 === 0) await sleep(0);
   }
+  if (!scanned && chars < Math.max(20, n * 5)) scanned = true;
+  if (scanned) return { title, author, scanned: true, doc, pages: n };
   doc.destroy();
-  if (chars < Math.max(20, doc.numPages * 5)) throw new Error('这本 PDF 是扫描图片，暂时无法提取文字');
   return { title, author, format: 'pdf', chapters: splitChapters(pdfJoinLines(all).join('\n')) };
+}
+
+// 把第 1 页画成小图当封面
+async function pdfCover(doc) {
+  try {
+    const page = await doc.getPage(1);
+    const v0 = page.getViewport({ scale: 1 });
+    const vp = page.getViewport({ scale: 360 / v0.width });
+    const c = document.createElement('canvas');
+    c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    page.cleanup();
+    const b = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.75));
+    c.width = c.height = 0;
+    return b;
+  } catch (e) { console.error(e); return null; }
 }
 
 
 /* =========================================================
  * 导入 & 书架
  * ========================================================= */
+const isQuota = e => e && (e.name === 'QuotaExceededError' || /quota|space/i.test(e.message || ''));
+
+async function importPdf(f, name) {
+  const mb = (f.size / 1048576).toFixed(1);
+  showLoading(`正在读取《${f.name}》（${mb} MB）…`);
+  // 复制一份（原图模式以后每次打开都要用原文件）
+  const blob = new Blob([await f.arrayBuffer()], { type: 'application/pdf' });
+  const res = await parsePdf(blob, name, (p, n) => showLoading(`正在导入《${f.name}》… 第 ${p}/${n} 页`));
+  const id = uid();
+  if (!res.scanned) {
+    if (!res.chapters.length) throw new Error('没有读到文字内容');
+    const total = res.chapters.reduce((s, c) => s + c.text.length + 1, 0);
+    await DB.put('contents', { id, chapters: res.chapters });
+    await DB.put('books', {
+      id, title: res.title, author: res.author, format: res.format, added: Date.now(), lastRead: 0,
+      total, chapterCount: res.chapters.length, pos: { ch: 0, off: 0 }, percent: 0, bookmarks: [], notes: []
+    });
+    toast(`已导入《${res.title}》，共 ${res.chapters.length} 章`);
+    return true;
+  }
+  // 扫描版：保存原文件，按原图一页一页看
+  showLoading(`扫描版 PDF，按原图保存（${mb} MB）…`);
+  const cover = await pdfCover(res.doc);
+  res.doc.destroy();
+  if (navigator.storage && navigator.storage.persist) { try { await navigator.storage.persist(); } catch (e) {} }
+  try {
+    await DB.put('contents', { id, pdf: blob, pages: res.pages });
+  } catch (e) {
+    if (isQuota(e)) throw new Error(`手机给小书房的存储空间不够，放不下这本 ${mb} MB 的 PDF。可以先删掉几本书，或清理手机空间后再试`);
+    throw e;
+  }
+  await DB.put('books', {
+    id, title: res.title, author: res.author, format: 'pdfimg', added: Date.now(), lastRead: 0,
+    pages: res.pages, cover, pos: { page: 0 }, percent: 0, bookmarks: [], notes: []
+  });
+  toast(`已导入《${res.title}》（原图模式，共 ${res.pages} 页）`);
+  return true;
+}
+
 async function importFiles(files) {
   let ok = 0;
   for (const f of files) {
     showLoading(`正在导入《${f.name}》…`);
     await sleep(50);
     try {
-      const buf = await f.arrayBuffer();
       const name = f.name.replace(/\.(txt|epub|pdf)$/i, '');
-      const head = new Uint8Array(buf.slice(0, 4));
+      const head = new Uint8Array(await f.slice(0, 4).arrayBuffer());
       const isZip = head[0] === 0x50 && head[1] === 0x4B;
       const isPdf = head[0] === 0x25 && head[1] === 0x50 && head[2] === 0x44 && head[3] === 0x46; // %PDF
-      const res = (/\.pdf$/i.test(f.name) || isPdf)
-        ? await parsePdf(buf, name, (p, n) => showLoading(`正在导入《${f.name}》… 第 ${p}/${n} 页`))
-        : (/\.epub$/i.test(f.name) || isZip) ? await parseEpub(buf, name) : parseTxt(buf, name);
+      if (/\.pdf$/i.test(f.name) || isPdf) { if (await importPdf(f, name)) ok++; continue; }
+      const buf = await f.arrayBuffer();
+      const res = (/\.epub$/i.test(f.name) || isZip) ? await parseEpub(buf, name) : parseTxt(buf, name);
       if (!res.chapters.length) throw new Error('没有读到文字内容');
       const id = uid();
       const total = res.chapters.reduce((s, c) => s + c.text.length + 1, 0);
@@ -342,16 +412,19 @@ async function importFiles(files) {
 
 const hue = s => { let h = 0; for (const c of s) h = (h * 31 + c.codePointAt(0)) % 360; return h; };
 
+let coverUrls = [];
 async function renderShelf() {
   const books = (await DB.all('books')).sort((a, b) => (b.lastRead || b.added) - (a.lastRead || a.added));
   $('#empty').classList.toggle('hidden', books.length > 0);
   $('#shelfTip').classList.toggle('hidden', books.length === 0);
+  coverUrls.forEach(u => URL.revokeObjectURL(u)); coverUrls = [];
+  const img = b => { if (!(b.cover instanceof Blob)) return ''; const u = URL.createObjectURL(b.cover); coverUrls.push(u); return `<img class="cover-img" src="${u}" alt="">`; };
   $('#books').innerHTML = books.map(b => `
     <div class="book" data-id="${b.id}">
-      <div class="cover" style="--h:${hue(b.title)}">
+      <div class="cover${b.cover ? ' has-img' : ''}" style="--h:${hue(b.title)}">${img(b)}
         <span class="cover-title">${esc(b.title)}</span>
         ${b.author ? `<span class="cover-author">${esc(b.author)}</span>` : ''}
-        <span class="cover-fmt">${b.format.toUpperCase()}</span>
+        <span class="cover-fmt">${b.format === 'pdfimg' ? 'PDF 原图' : b.format.toUpperCase()}</span>
       </div>
       <div class="book-name">${esc(b.title)}</div>
       <div class="book-prog">${b.lastRead ? '已读 ' + fmtPct(b.percent) : '未读'}</div>
@@ -422,6 +495,7 @@ async function openBook(id) {
   const [meta, c] = await Promise.all([DB.get('books', id), DB.get('contents', id)]);
   hideLoading();
   if (!meta || !c) return toast('找不到这本书的数据');
+  if (meta.format === 'pdfimg') return openPdfView(meta, c);
   R.meta = meta; R.chapters = c.chapters;
   meta.bookmarks = meta.bookmarks || []; meta.notes = meta.notes || [];
   R.starts = []; let s = 0;
@@ -436,6 +510,220 @@ async function openBook(id) {
   const p = meta.pos || { ch: 0, off: 0 };
   openChapter(Math.min(p.ch, R.chapters.length - 1), p.off || 0);
   meta.lastRead = Date.now(); saveMeta();
+}
+
+/* =========================================================
+ * PDF 原图模式（扫描版 PDF：一页一页画出来看）
+ * ========================================================= */
+const P = { open: false, meta: null, doc: null, n: 1, page: 0, zoom: 1, cache: new Map(), queue: Promise.resolve(), gen: 0, menu: false };
+const PDF_ZOOMS = [1, 1.5, 2, 3];
+
+async function openPdfView(meta, c) {
+  showLoading('正在打开…');
+  try { P.doc = await openPdfBlob(c.pdf); }
+  catch (e) { hideLoading(); console.error(e); return dialog({ title: '打开失败', html: esc(e.message || String(e)), buttons: [{ text: '知道了', cls: 'main' }] }); }
+  hideLoading();
+  Object.assign(P, { open: true, meta, n: P.doc.numPages, zoom: 1, menu: false });
+  P.page = Math.min(Math.max(0, (meta.pos && meta.pos.page) || 0), P.n - 1);
+  $('#shelf').classList.add('hidden');
+  $('#pdfv').classList.remove('hidden');
+  $('#pdfv').classList.remove('menu-on');
+  $('#pdfTitle').textContent = meta.title;
+  $('#pdfProg').max = P.n;
+  history.pushState({ reader: 1 }, '');
+  meta.lastRead = Date.now();
+  pdfShow(P.page);
+}
+
+function closePdfView() {
+  if (!P.open) return;
+  pdfSave();
+  P.open = false; P.gen++;
+  pdfDropCache(() => false);
+  $('#pdfStage').innerHTML = '';
+  if (P.doc) { P.doc.destroy(); P.doc = null; }
+  $('#pdfv').classList.add('hidden');
+  $('#shelf').classList.remove('hidden');
+  renderShelf();
+}
+
+function pdfSave() {
+  if (!P.open || !P.meta) return;
+  P.meta.pos = { page: P.page };
+  P.meta.percent = P.n > 1 ? P.page / (P.n - 1) : 1;
+  P.meta.lastRead = Date.now();
+  DB.put('books', P.meta).catch(e => console.error(e));
+}
+
+// 释放画布内存（iOS 对画布总内存限制很严）
+function pdfDropCache(keep) {
+  for (const [k, v] of P.cache) if (!keep(k)) { v.width = v.height = 0; P.cache.delete(k); }
+}
+
+// 计算一页的显示大小：缩放 1 时整页放进屏幕
+function pdfSize(page) {
+  const sc = $('#pdfScroll');
+  const W = sc.clientWidth, H = sc.clientHeight;
+  const v = page.getViewport({ scale: 1 });
+  const fit = Math.min(W / v.width, H / v.height);
+  const css = fit * P.zoom;
+  let dpr = Math.min(window.devicePixelRatio || 1, 3);
+  const MAX_PX = 10e6;   // 每张画布最多约 1000 万像素
+  const px = v.width * v.height * (css * dpr) ** 2;
+  if (px > MAX_PX) dpr *= Math.sqrt(MAX_PX / px);
+  return { cssW: Math.floor(v.width * css), cssH: Math.floor(v.height * css), scale: css * dpr };
+}
+
+// 一次只画一页，排队进行
+function pdfRender(i) {
+  const gen = P.gen;
+  const job = P.queue.then(async () => {
+    if (gen !== P.gen || !P.doc) return null;
+    if (P.cache.has(i)) return P.cache.get(i);
+    const page = await P.doc.getPage(i + 1);
+    const s = pdfSize(page);
+    const c = document.createElement('canvas');
+    const vp = page.getViewport({ scale: s.scale });
+    c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+    c.style.width = s.cssW + 'px'; c.style.height = s.cssH + 'px';
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    page.cleanup();
+    if (gen !== P.gen) { c.width = c.height = 0; return null; }
+    P.cache.set(i, c);
+    return c;
+  });
+  P.queue = job.catch(() => null);
+  return job;
+}
+
+async function pdfShow(i, keepScroll) {
+  i = Math.min(Math.max(0, i), P.n - 1);
+  P.page = i;
+  pdfStatus();
+  const stage = $('#pdfStage');
+  if (!P.cache.has(i)) stage.classList.add('loading');
+  let c;
+  try { c = await pdfRender(i); } catch (e) { console.error(e); toast('这一页显示失败'); }
+  if (!c || P.page !== i || !P.open) return;
+  stage.classList.remove('loading');
+  stage.replaceChildren(c);
+  if (!keepScroll) { const sc = $('#pdfScroll'); sc.scrollTop = 0; sc.scrollLeft = 0; }
+  pdfDropCache(k => Math.abs(k - i) <= 1);
+  // 预先画好前后两页，翻页更快
+  if (i + 1 < P.n) pdfRender(i + 1).then(() => pdfDropCache(k => Math.abs(k - P.page) <= 1));
+  if (i > 0) pdfRender(i - 1).then(() => pdfDropCache(k => Math.abs(k - P.page) <= 1));
+  clearTimeout(P.saveT); P.saveT = setTimeout(pdfSave, 600);
+}
+
+function pdfStatus() {
+  $('#pdfPageNo').textContent = `${P.page + 1} / ${P.n}`;
+  $('#pdfProg').value = P.page + 1;
+  $('#pdfZoom').textContent = P.zoom === 1 ? '放大' : `${P.zoom}×`;
+}
+
+function pdfNext() { if (P.page < P.n - 1) pdfShow(P.page + 1); else toast('已经是最后一页了'); }
+function pdfPrev() { if (P.page > 0) pdfShow(P.page - 1); else toast('已经是第一页了'); }
+
+function pdfSetZoom(z, cx, cy) {
+  z = Math.min(4, Math.max(1, Math.round(z * 10) / 10));
+  if (z === P.zoom) return;
+  const sc = $('#pdfScroll');
+  // 保持手指/屏幕中心位置附近的内容不跑
+  const fx = (sc.scrollLeft + (cx ?? sc.clientWidth / 2)) / Math.max(1, sc.scrollWidth);
+  const fy = (sc.scrollTop + (cy ?? sc.clientHeight / 2)) / Math.max(1, sc.scrollHeight);
+  P.zoom = z; P.gen++;
+  pdfDropCache(() => false);
+  P.queue = Promise.resolve();
+  pdfShow(P.page, true).then(() => {
+    sc.scrollLeft = fx * sc.scrollWidth - (cx ?? sc.clientWidth / 2);
+    sc.scrollTop = fy * sc.scrollHeight - (cy ?? sc.clientHeight / 2);
+  });
+}
+
+function pdfToggleMenu(on = !P.menu) { P.menu = on; $('#pdfv').classList.toggle('menu-on', on); }
+
+function bindPdfView() {
+  const sc = $('#pdfScroll'), stage = $('#pdfStage');
+  let t0 = null, pinch = null;
+  const dist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+  sc.addEventListener('touchstart', e => {
+    if (e.touches.length === 2) {
+      const [a, b] = e.touches, r = sc.getBoundingClientRect();
+      pinch = { d: dist(a, b), r: 1, cx: (a.clientX + b.clientX) / 2 - r.left, cy: (a.clientY + b.clientY) / 2 - r.top };
+      t0 = null;
+    } else if (e.touches.length === 1 && !pinch) {
+      const t = e.touches[0];
+      t0 = { x: t.clientX, y: t.clientY, time: Date.now(), sl: sc.scrollLeft };
+    }
+  }, { passive: true });
+  sc.addEventListener('touchmove', e => {
+    if (pinch && e.touches.length === 2) {
+      e.preventDefault();
+      pinch.r = dist(e.touches[0], e.touches[1]) / pinch.d;
+      stage.style.transformOrigin = `${pinch.cx + sc.scrollLeft}px ${pinch.cy + sc.scrollTop}px`;
+      stage.style.transform = `scale(${pinch.r})`;
+    }
+  }, { passive: false });
+  sc.addEventListener('touchend', e => {
+    if (pinch) {
+      if (e.touches.length === 0) {
+        stage.style.transform = '';
+        const p = pinch; pinch = null;
+        if (Math.abs(p.r - 1) > 0.05) pdfSetZoom(P.zoom * p.r, p.cx, p.cy);
+      }
+      return;
+    }
+    if (!t0) return;
+    const t = e.changedTouches[0], dx = t.clientX - t0.x, dy = t.clientY - t0.y, dt = Date.now() - t0.time;
+    const start = t0; t0 = null;
+    const W = sc.clientWidth;
+    if (Math.abs(dx) < 10 && Math.abs(dy) < 10 && dt < 400) {
+      e.preventDefault();
+      if (P.menu) return pdfToggleMenu(false);
+      const x = t.clientX - sc.getBoundingClientRect().left;
+      if (x < W * 0.3) pdfPrev(); else if (x > W * 0.7) pdfNext(); else pdfToggleMenu(true);
+      return;
+    }
+    // 左右滑动翻页（放大时只有已经滑到边上才翻页）
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && dt < 800) {
+      const atLeft = start.sl <= 1, atRight = start.sl >= sc.scrollWidth - sc.clientWidth - 1;
+      if (dx < 0 && (P.zoom === 1 || atRight)) pdfNext();
+      else if (dx > 0 && (P.zoom === 1 || atLeft)) pdfPrev();
+    }
+  });
+  sc.addEventListener('dblclick', e => e.preventDefault());
+  document.addEventListener('gesturestart', e => { if (P.open) e.preventDefault(); });
+  // 电脑上用鼠标点
+  sc.addEventListener('click', e => {
+    if (e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents) return;
+    if ('ontouchstart' in window) return;
+    if (P.menu) return pdfToggleMenu(false);
+    const W = sc.clientWidth, x = e.clientX - sc.getBoundingClientRect().left;
+    if (x < W * 0.3) pdfPrev(); else if (x > W * 0.7) pdfNext(); else pdfToggleMenu(true);
+  });
+  document.addEventListener('keydown', e => {
+    if (!P.open) return;
+    if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') pdfNext();
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') pdfPrev();
+  });
+  $('#pdfBack').onclick = () => history.back();
+  $('#pdfPrevBtn').onclick = pdfPrev;
+  $('#pdfNextBtn').onclick = pdfNext;
+  $('#pdfZoom').onclick = () => { const i = PDF_ZOOMS.findIndex(z => z > P.zoom + 0.01); pdfSetZoom(i < 0 ? 1 : PDF_ZOOMS[i]); };
+  const prog = $('#pdfProg');
+  prog.oninput = () => { $('#pdfPageNo').textContent = `${prog.value} / ${P.n}`; };
+  prog.onchange = () => pdfShow(+prog.value - 1);
+  $('#pdfJump').onclick = async () => {
+    const r = await dialog({
+      title: '跳到第几页', html: `<input id="pdfJumpIn" type="number" inputmode="numeric" min="1" max="${P.n}" value="${P.page + 1}" style="width:100%;height:44px;font-size:18px;text-align:center;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)">`,
+      buttons: [{ text: '取消' }, { text: '跳转', cls: 'main', key: 'go' }], focus: '#pdfJumpIn'
+    });
+    if (r.key === 'go') { const v = parseInt(r.value, 10); if (v >= 1 && v <= P.n) pdfShow(v - 1); }
+  };
+  let rz;
+  window.addEventListener('resize', () => { if (!P.open) return; clearTimeout(rz); rz = setTimeout(() => { P.gen++; P.queue = Promise.resolve(); pdfDropCache(() => false); pdfShow(P.page, true); }, 250); });
 }
 
 function closeReader() {
@@ -674,12 +962,14 @@ function bindReader() {
 
   let rt;
   window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(relayout, 200); });
-  document.addEventListener('visibilitychange', () => { if (document.hidden) savePos(); else ttsWake(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { savePos(); pdfSave(); } else ttsWake(); });
+  window.addEventListener('pagehide', pdfSave);
   window.addEventListener('pagehide', savePos);
   window.addEventListener('popstate', () => {
     if (!$('#modalMask').classList.contains('hidden')) { $('#modalMask').querySelector('[data-i="0"]')?.click(); history.pushState({ reader: 1 }, ''); return; }
     if (sheetOpen()) { closeSheet(true); if (reading) history.pushState({ reader: 1 }, ''); return; }
-    if (reading) closeReader();
+    if (P.open) closePdfView();
+    else if (reading) closeReader();
   });
 }
 
@@ -1182,7 +1472,7 @@ function dialog({ title, html = '', buttons, focus }) {
     modal.querySelector('.m-btns').onclick = e => {
       const b = e.target.closest('button'); if (!b) return;
       const i = +b.dataset.i;
-      const value = modal.querySelector('textarea')?.value;
+      const value = modal.querySelector('textarea, input')?.value;
       mask.classList.add('hidden'); modal.innerHTML = '';
       res({ i, key: buttons[i].key, value });
     };
@@ -1201,7 +1491,7 @@ function hideLoading() { $('#loading').classList.add('hidden'); }
  * ========================================================= */
 (async function init() {
   applySettings();
-  bindShelf(); bindReader(); bindTts();
+  bindShelf(); bindReader(); bindTts(); bindPdfView();
   $('#sheetClose').onclick = () => closeSheet();
   $('#sheetMask').onclick = () => closeSheet();
   try { await DB.open(); }

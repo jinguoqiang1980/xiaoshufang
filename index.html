@@ -86,6 +86,26 @@
   </div>
 </section>
 
+<!-- ============ PDF 原图阅读页 ============ -->
+<section id="pdfv" class="screen hidden">
+  <div id="pdfScroll"><div id="pdfStage"></div></div>
+  <div id="pdfTop" class="bar">
+    <button id="pdfBack" class="bar-btn" aria-label="返回书架">
+      <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg><span>书架</span>
+    </button>
+    <div id="pdfTitle"></div>
+    <button id="pdfZoom" class="bar-btn" aria-label="缩放">放大</button>
+  </div>
+  <div id="pdfBottom" class="bar">
+    <div class="prog-row">
+      <button id="pdfPrevBtn" class="txt-btn">上一页</button>
+      <input type="range" id="pdfProg" min="1" max="1" value="1">
+      <button id="pdfNextBtn" class="txt-btn">下一页</button>
+    </div>
+    <div class="prog-row pdf-info"><button id="pdfJump" class="txt-btn">跳页</button><span id="pdfPageNo"></span><span class="pdf-tip">点左右两边或左右滑动翻页，双指缩放</span></div>
+  </div>
+</section>
+
 <!-- ============ 弹出面板 / 对话框 ============ -->
 <div id="sheetMask" class="mask hidden"></div>
 <div id="sheet" class="sheet">
